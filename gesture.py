@@ -19,13 +19,13 @@ Setup (Terminal):
     python -m venv .venv
     .venv\Scripts\activate            # Windows
     # source .venv/bin/activate       # macOS / Linux
-    pip install opencv-python mediapipe requests python-dotenv
+    pip install opencv-python mediapipe requests python-dotenv streamlit
 
 Environment (optional .env file for local dev):
     GESTURE_API_KEY=YOUR_API_KEY
 
 Run:
-    python gesture_app.py
+    streamlit run gesture.py
 
 VS Code tips:
 - Use the Python extension, select your venv interpreter
@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Tuple
 # Third-party
 import cv2
 import requests
+import streamlit as st
 
 # MediaPipe
 import mediapipe as mp
@@ -256,100 +257,123 @@ def send_gesture_api_call(gesture: GestureEvent) -> None:
 # --------------------------- Main Application ---------------------------------
 
 def main() -> None:
+    st.set_page_config(page_title="Gesture Recognition", layout="wide")
+    st.title("Real-Time Hand Gesture Recognition")
+    st.markdown("Use your webcam to detect hand gestures in real-time.")
+
+    run = st.checkbox("Run Webcam")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        frame_window = st.image([])
+        
+    with col2:
+        st.markdown("### Status")
+        gesture_text = st.empty()
+        confidence_text = st.empty()
+        api_status = st.empty()
+
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # On Linux/macOS, omit CAP_DSHOW
-    if not cap.isOpened():
-        logger.error("Unable to open webcam. Check your camera or index.")
-        return
+    if run:
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # On Linux/macOS, omit CAP_DSHOW
+        if not cap.isOpened():
+            st.error("Unable to open webcam. Check your camera or index.")
+            return
 
-    logger.info("Starting camera. Press 'q' to quit.")
+        logger.info("Starting camera.")
 
-    # Gesture debouncing state
-    last_label: Optional[str] = None
-    stable_count = 0
-    last_api_time: Dict[str, float] = {}
+        # Gesture debouncing state
+        last_label: Optional[str] = None
+        stable_count = 0
+        last_api_time: Dict[str, float] = {}
 
-    with mp_hands.Hands(
-        model_complexity=1,
-        max_num_hands=MAX_NUM_HANDS,
-        min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
-    ) as hands:
+        with mp_hands.Hands(
+            model_complexity=1,
+            max_num_hands=MAX_NUM_HANDS,
+            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        ) as hands:
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                logger.warning("Frame grab failed; retrying...")
-                continue
+            while run:
+                ok, frame = cap.read()
+                if not ok:
+                    st.warning("Frame grab failed; retrying...")
+                    time.sleep(0.1)
+                    continue
 
-            # Mirror image for selfie view and pass to MediaPipe
-            frame = cv2.flip(frame, 1)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Mirror image for selfie view and pass to MediaPipe
+                frame = cv2.flip(frame, 1)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            results = hands.process(frame_rgb)
+                results = hands.process(frame_rgb)
 
-            gesture_label_to_show = "No hand"
-            confidence_to_show = 0.0
+                gesture_label_to_show = "No hand"
+                confidence_to_show = 0.0
 
-            if results.multi_hand_landmarks and results.multi_handedness:
-                # Only consider the first detected hand (as configured)
-                hand_landmarks = results.multi_hand_landmarks[0]
-                handedness = results.multi_handedness[0].classification[0].label  # 'Left'/'Right'
+                if results.multi_hand_landmarks and results.multi_handedness:
+                    # Only consider the first detected hand (as configured)
+                    hand_landmarks = results.multi_hand_landmarks[0]
+                    handedness = results.multi_handedness[0].classification[0].label  # 'Left'/'Right'
 
-                # Convert landmarks to normalized (x,y) tuples for convenience
-                lm_xy: List[Tuple[float, float]] = [
-                    (lm.x, lm.y) for lm in hand_landmarks.landmark
-                ]
+                    # Convert landmarks to normalized (x,y) tuples for convenience
+                    lm_xy: List[Tuple[float, float]] = [
+                        (lm.x, lm.y) for lm in hand_landmarks.landmark
+                    ]
 
-                # Classify gesture
-                gesture = classify_gesture(lm_xy, handedness)
-                gesture_label_to_show = gesture.name
-                confidence_to_show = gesture.confidence
+                    # Classify gesture
+                    gesture = classify_gesture(lm_xy, handedness)
+                    gesture_label_to_show = gesture.name
+                    confidence_to_show = gesture.confidence
 
-                # Draw landmarks
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style(),
-                )
+                    # Draw landmarks
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style(),
+                    )
 
-                # Debounce: require same label for N frames
-                if gesture.name == last_label and gesture.name != "UNKNOWN":
-                    stable_count += 1
-                else:
-                    stable_count = 1
-                    last_label = gesture.name
+                    # Debounce: require same label for N frames
+                    if gesture.name == last_label and gesture.name != "UNKNOWN":
+                        stable_count += 1
+                    else:
+                        stable_count = 1
+                        last_label = gesture.name
 
-                # If stable, print & call API (cooldown per gesture)
-                if stable_count >= STABLE_FRAMES_REQUIRED and gesture.name != "UNKNOWN":
-                    now = time.time()
-                    last_time = last_api_time.get(gesture.name, 0.0)
-                    if now - last_time >= DEFAULT_COOLDOWN_SEC:
-                        print(f"[GESTURE] {gesture.name} (conf={gesture.confidence:.2f})")
-                        send_gesture_api_call(gesture)
-                        last_api_time[gesture.name] = now
+                    # If stable, print & call API (cooldown per gesture)
+                    if stable_count >= STABLE_FRAMES_REQUIRED and gesture.name != "UNKNOWN":
+                        now = time.time()
+                        last_time = last_api_time.get(gesture.name, 0.0)
+                        if now - last_time >= DEFAULT_COOLDOWN_SEC:
+                            logger.info(f"[GESTURE] {gesture.name} (conf={gesture.confidence:.2f})")
+                            api_status.success(f"**{gesture.name}** detected! API called at {time.strftime('%X')}")
+                            send_gesture_api_call(gesture)
+                            last_api_time[gesture.name] = now
 
-            # HUD overlay
-            cv2.rectangle(frame, (10, 10), (310, 90), (0, 0, 0), -1)
-            cv2.putText(frame, f"Gesture: {gesture_label_to_show}",
-                        (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, f"Conf: {confidence_to_show:.2f}",
-                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
+                # HUD overlay
+                cv2.rectangle(frame, (10, 10), (310, 90), (0, 0, 0), -1)
+                cv2.putText(frame, f"Gesture: {gesture_label_to_show}",
+                            (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(frame, f"Conf: {confidence_to_show:.2f}",
+                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
 
-            cv2.imshow("Hand Gesture Recognition (Press 'q' to quit)", frame)
+                # Update Streamlit UI
+                gesture_text.markdown(f"**Current Gesture:** {gesture_label_to_show}")
+                confidence_text.markdown(f"**Confidence:** {confidence_to_show:.2f}")
 
-            # Quit on 'q'
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # Convert BGR back to RGB for displaying in Streamlit
+                frame_out = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_window.image(frame_out)
 
-    cap.release()
-    cv2.destroyAllWindows()
-    logger.info("Stopped.")
+        cap.release()
+        logger.info("Stopped.")
+    else:
+        st.info("Click 'Run Webcam' to start gesture recognition.")
 
 
 if __name__ == "__main__":
